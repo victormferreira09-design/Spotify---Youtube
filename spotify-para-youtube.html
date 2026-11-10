@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotify para YouTube</title>
+<style>
+:root{--bg:#edf0f2;--panel:#f8fafb;--ink:#16202a;--mute:#5b6874;--line:#c9d1d8;--green:#138a3e;--red:#c8232a;--warn:#8a5a00;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#12181e;--panel:#1a222a;--ink:#e8edf1;--mute:#93a0ab;--line:#2b3640;--green:#3ed377;--red:#ff6b70;--warn:#f0b84a;color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:16px/1.5 "Avenir Next","Segoe UI",system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:24px 16px 64px}
+.route{display:flex;align-items:stretch;border:2px solid var(--ink);border-radius:6px;overflow:hidden;font-weight:700;font-size:1.25rem}
+.route span{padding:10px 16px;flex:1}
+.route .sp{background:var(--green);color:#fff}
+.route .yt{background:var(--red);color:#fff;text-align:right}
+.route i{font-style:normal;display:grid;place-items:center;padding:0 10px;background:var(--panel)}
+h1{font-size:1.5rem;margin:20px 0 6px;letter-spacing:-.01em}
+p.lead{margin:0 0 20px;color:var(--mute)}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;margin-bottom:16px}
+h2{font-size:1rem;margin:0 0 12px}
+label{display:block;font-size:.875rem;color:var(--mute);margin:12px 0 4px}
+label:first-of-type{margin-top:0}
+input[type=text],input[type=number]{width:100%;padding:10px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--ink);font:inherit}
+input:focus-visible,button:focus-visible,summary:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button{font:inherit;font-weight:600;padding:10px 14px;border:2px solid var(--ink);border-radius:4px;background:var(--panel);color:var(--ink);cursor:pointer}
+button.main{background:var(--ink);color:var(--bg)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.status{font-size:.875rem;color:var(--mute)}
+.status b{color:var(--green)}
+.chk{display:flex;gap:8px;align-items:center;margin:12px 0;font-size:.9375rem;color:var(--ink)}
+.chk input{width:20px;height:20px}
+details{margin-top:12px;font-size:.875rem;color:var(--mute)}
+summary{cursor:pointer;color:var(--ink)}
+code{background:var(--bg);padding:1px 5px;border-radius:3px;word-break:break-all}
+ol#log{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto;font-size:.875rem}
+#log li{padding:5px 0;border-bottom:1px solid var(--line)}
+#log .ok{color:var(--green)}
+#log .warn{color:var(--warn)}
+#log .err{color:var(--red)}
+#prog{font-size:.875rem;color:var(--mute);margin:8px 0 0}
+</style>
+</head>
+<body>
+<main>
+<div class="route" aria-hidden="true"><span class="sp">Spotify</span><i>→</i><span class="yt">YouTube</span></div>
+<h1>Sincronizar playlists</h1>
+<p class="lead">Adiciona na playlist do YouTube as músicas novas da playlist do Spotify. Só entra o vídeo que bate com artista, nome e duração; o que for duvidoso fica de fora e aparece na lista.</p>
+
+<section>
+<h2>1. Configuração</h2>
+<label for="spClient">Client ID do Spotify</label>
+<input type="text" id="spClient" autocomplete="off">
+<label for="gClient">Client ID do Google (OAuth, tipo Web)</label>
+<input type="text" id="gClient" autocomplete="off">
+<label for="spPlaylist">Playlist do Spotify (link ou ID)</label>
+<input type="text" id="spPlaylist" autocomplete="off">
+<label for="ytPlaylist">Playlist do YouTube (link ou ID)</label>
+<input type="text" id="ytPlaylist" autocomplete="off">
+<details><summary>Endereço para cadastrar nos dois painéis</summary>
+<p>Spotify: Redirect URI <code id="redir"></code><br>Google: Origem JavaScript autorizada <code id="origin"></code></p></details>
+</section>
+
+<section>
+<h2>2. Conectar</h2>
+<div class="row"><button id="bSp">Conectar Spotify</button><span class="status" id="sSp">desconectado</span></div>
+<div class="row" style="margin-top:8px"><button id="bG">Conectar Google</button><span class="status" id="sG">desconectado</span></div>
+</section>
+
+<section>
+<h2>3. Sincronizar</h2>
+<label for="tol">Diferença máxima de duração (segundos)</label>
+<input type="number" id="tol" min="1" max="60" value="10">
+<label class="chk"><input type="checkbox" id="dry" checked> Só simular (não adiciona nada no YouTube)</label>
+<div class="row"><button class="main" id="bGo" disabled>Sincronizar</button><button id="bClr">Limpar memória</button></div>
+<p id="prog"></p>
+</section>
+
+<section>
+<h2>Registro</h2>
+<ol id="log"></ol>
+</section>
+</main>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+const $ = id => document.getElementById(id);
+const REDIRECT = location.origin + location.pathname;
+const store = {
+  get(k, d){ try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set(k, v){ localStorage.setItem(k, JSON.stringify(v)); }
+};
+let spToken = null, ytToken = null;
+
+function log(msg, cls = ''){
+  const li = document.createElement('li');
+  li.textContent = msg; if (cls) li.className = cls;
+  const ol = $('log'); ol.appendChild(li); ol.scrollTop = ol.scrollHeight;
+}
+
+/* ---------- configuração ---------- */
+const FIELDS = ['spClient', 'gClient', 'spPlaylist', 'ytPlaylist', 'tol'];
+const cfg = () => Object.fromEntries(FIELDS.map(f => [f, $(f).value.trim()]));
+FIELDS.forEach(f => {
+  $(f).value = store.get('cfg', {})[f] ?? $(f).value;
+  $(f).addEventListener('input', () => store.set('cfg', cfg()));
+});
+$('redir').textContent = REDIRECT;
+$('origin').textContent = location.origin;
+
+function refresh(){
+  $('sSp').innerHTML = spToken ? '<b>conectado</b>' : 'desconectado';
+  $('sG').innerHTML = ytToken ? '<b>conectado</b>' : 'desconectado';
+  $('bGo').disabled = !(spToken && ytToken);
+}
+
+/* ---------- Spotify (PKCE) ---------- */
+const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function spLogin(){
+  const cid = $('spClient').value.trim();
+  if (!cid) return log('Informe o Client ID do Spotify.', 'err');
+  const verifier = b64(crypto.getRandomValues(new Uint8Array(32)));
+  sessionStorage.setItem('verifier', verifier);
+  const challenge = b64(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  location.href = 'https://accounts.spotify.com/authorize?' + new URLSearchParams({
+    client_id: cid, response_type: 'code', redirect_uri: REDIRECT,
+    scope: 'playlist-read-private playlist-read-collaborative',
+    code_challenge_method: 'S256', code_challenge: challenge
+  });
+}
+
+async function spCallback(){
+  const saved = JSON.parse(sessionStorage.getItem('spToken') || 'null');
+  if (saved && saved.exp > Date.now()) spToken = saved.t;
+  const code = new URLSearchParams(location.search).get('code');
+  if (!code) return;
+  history.replaceState({}, '', REDIRECT);
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: store.get('cfg', {}).spClient, grant_type: 'authorization_code',
+      code, redirect_uri: REDIRECT, code_verifier: sessionStorage.getItem('verifier')
+    })
+  });
+  const j = await r.json();
+  if (j.access_token){
+    spToken = j.access_token;
+    sessionStorage.setItem('spToken', JSON.stringify({ t: spToken, exp: Date.now() + (j.expires_in - 60) * 1000 }));
+    log('Spotify conectado.', 'ok');
+  } else log('Falha no login do Spotify: ' + (j.error_description || j.error), 'err');
+}
+
+const spId = s => (s.match(/playlist[\/:]([A-Za-z0-9]+)/) || [, s.trim()])[1];
+
+async function spGet(url){
+  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + spToken } });
+  if (!r.ok) throw Object.assign(new Error('Spotify respondeu ' + r.status), { status: r.status });
+  return r.json();
+}
+
+async function spTracks(id){
+  let url = `https://api.spotify.com/v1/playlists/${id}/items?limit=50`, out = [], first = true;
+  while (url){
+    let j;
+    try { j = await spGet(url); }
+    catch (e){
+      if (first && e.status === 404){ url = `https://api.spotify.com/v1/playlists/${id}/tracks?limit=50`; first = false; continue; }
+      throw e;
+    }
+    first = false;
+    for (const it of j.items){
+      const t = it.item || it.track;
+      if (t && t.id && !t.is_local && t.type !== 'episode')
+        out.push({ id: t.id, name: t.name, artists: t.artists.map(a => a.name), ms: t.duration_ms });
+    }
+    url = j.next;
+  }
+  return out;
+}
+
+/* ---------- Google / YouTube ---------- */
+function gLogin(){
+  const cid = $('gClient').value.trim();
+  if (!cid) return log('Informe o Client ID do Google.', 'err');
+  if (!window.google || !google.accounts) return log('A biblioteca do Google ainda está carregando. Tente de novo.', 'err');
+  google.accounts.oauth2.initTokenClient({
+    client_id: cid, scope: 'https://www.googleapis.com/auth/youtube',
+    callback: r => {
+      if (r.access_token){ ytToken = r.access_token; log('Google conectado.', 'ok'); }
+      else log('Falha no login do Google.', 'err');
+      refresh();
+    }
+  }).requestAccessToken();
+}
+
+const ytId = s => (s.match(/[?&]list=([\w-]+)/) || [, s.trim()])[1];
+
+async function yt(path, params, opt = {}){
+  const r = await fetch('https://www.googleapis.com/youtube/v3/' + path + '?' + new URLSearchParams(params), {
+    method: opt.method || 'GET',
+    headers: { Authorization: 'Bearer ' + ytToken, 'Content-Type': 'application/json' },
+    body: opt.body ? JSON.stringify(opt.body) : undefined
+  });
+  const j = await r.json();
+  if (!r.ok) throw Object.assign(new Error(j.error?.message || 'YouTube respondeu ' + r.status),
+    { reason: j.error?.errors?.[0]?.reason, status: r.status });
+  return j;
+}
+
+async function ytExisting(pid){
+  const set = new Set(); let tok;
+  do {
+    const j = await yt('playlistItems', { part: 'contentDetails', playlistId: pid, maxResults: 50, ...(tok && { pageToken: tok }) });
+    j.items.forEach(i => set.add(i.contentDetails.videoId));
+    tok = j.nextPageToken;
+  } while (tok);
+  return set;
+}
+
+/* ---------- casamento rigoroso: artista + nome + duração ---------- */
+const norm = s => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+const coreName = n => (n.replace(/\s*[\(\[][^\)\]]*[\)\]]/g, '').replace(/\s+-\s+.*$/, '').trim()) || n;
+const BAD = ['cover', 'remix', 'live', 'ao vivo', 'karaoke', 'instrumental', 'reaction', 'tribute', 'slowed',
+  'sped up', 'nightcore', '8d', 'reverb', 'acoustic', 'mashup', 'piano version', 'type beat'];
+const dur = iso => {
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  return ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0)) * 1000;
+};
+
+async function findVideo(t, tolMs){
+  const main = norm(coreName(t.name)), full = ' ' + norm(t.name) + ' ';
+  const arts = t.artists.map(norm);
+  const s = await yt('search', { part: 'snippet', type: 'video', videoCategoryId: '10', maxResults: 10,
+    q: `${t.artists[0]} ${coreName(t.name)}` });
+  const ids = s.items.map(i => i.id.videoId).join(',');
+  if (!ids) return null;
+  const d = await yt('videos', { part: 'contentDetails,snippet', id: ids });
+  let best = null;
+  for (const v of d.items){
+    const title = norm(v.snippet.title), chan = norm(v.snippet.channelTitle);
+    const text = ` ${title} ${chan} `;
+    if (!text.includes(' ' + main + ' ')) continue;                       // nome da música
+    if (!arts.some(a => (title + ' ' + chan).includes(a))) continue;      // artista
+    if (BAD.some(w => text.includes(' ' + w + ' ') && !full.includes(' ' + w + ' '))) continue; // cover, remix, ao vivo...
+    const diff = Math.abs(dur(v.contentDetails.duration) - t.ms);
+    if (diff > tolMs) continue;                                           // duração
+    const score = 10 - diff / 1000 + (chan.endsWith(' topic') ? 5 : 0)
+      + (title.includes('official audio') ? 2 : 0) + (title.includes('official') ? 1 : 0);
+    if (!best || score > best.score) best = { id: v.id, score };
+  }
+  return best ? best.id : null;
+}
+
+/* ---------- sincronização ---------- */
+async function sync(){
+  const c = cfg(), dry = $('dry').checked, tolMs = (+c.tol || 10) * 1000;
+  if (!c.spPlaylist || !c.ytPlaylist) return log('Preencha as duas playlists.', 'err');
+  $('bGo').disabled = true;
+  const cache = store.get('map', {});
+  let added = 0, skipped = 0, nf = 0;
+  try {
+    log('Lendo a playlist do Spotify…');
+    const tracks = await spTracks(spId(c.spPlaylist));
+    const pid = ytId(c.ytPlaylist);
+    const inPl = await ytExisting(pid);
+    log(`${tracks.length} músicas no Spotify, ${inPl.size} vídeos no YouTube.`);
+    for (const [i, t] of tracks.entries()){
+      $('prog').textContent = `${i + 1} de ${tracks.length}`;
+      const label = `${t.artists[0]} — ${t.name}`;
+      let vid = cache[t.id];
+      if (vid === null){ nf++; continue; }
+      if (vid && inPl.has(vid)){ skipped++; continue; }
+      if (!vid){
+        vid = await findVideo(t, tolMs);
+        cache[t.id] = vid || null; store.set('map', cache);
+        if (!vid){ nf++; log('Sem vídeo confiável: ' + label, 'warn'); continue; }
+      }
+      if (inPl.has(vid)){ skipped++; continue; }
+      if (dry){ log('Adicionaria: ' + label, 'ok'); continue; }
+      await yt('playlistItems', { part: 'snippet' }, { method: 'POST',
+        body: { snippet: { playlistId: pid, resourceId: { kind: 'youtube#video', videoId: vid } } } });
+      inPl.add(vid); added++; log('Adicionada: ' + label, 'ok');
+    }
+    log(`Pronto. Adicionadas: ${added}. Já estavam: ${skipped}. Sem vídeo confiável: ${nf}.`, 'ok');
+  } catch (e){
+    if (e.reason === 'quotaExceeded') log('Cota diária do YouTube acabou. O progresso foi guardado: rode de novo amanhã.', 'err');
+    else if (e.status === 401) log('Login expirou. Conecte de novo.', 'err');
+    else log('Erro: ' + e.message, 'err');
+  }
+  $('prog').textContent = '';
+  $('bGo').disabled = !(spToken && ytToken);
+}
+
+$('bSp').onclick = spLogin;
+$('bG').onclick = gLogin;
+$('bGo').onclick = sync;
+$('bClr').onclick = () => { store.set('map', {}); log('Memória de músicas limpa.'); };
+
+spCallback().then(refresh);
+refresh();
+</script>
+</body>
+</html>
