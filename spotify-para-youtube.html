@@ -336,13 +336,15 @@ async function useManual(id, url){
 }
 
 /* ---------- sincronização ---------- */
+const isQuota = e => e.reason === 'quotaExceeded' || /quota/i.test(e.message || '');
+
 async function sync(){
   const c = cfg(), dry = $('dry').checked, tolMs = (+c.tol || 10) * 1000;
   const wide = $('wide').checked, retry = $('retry').checked;
   if (!c.spPlaylist || !c.ytPlaylist) return log('Preencha as duas playlists.', 'err');
   $('bGo').disabled = true;
   const cache = store.get('map', {}), pend = store.get('pend', {});
-  let added = 0, skipped = 0, nf = 0;
+  let added = 0, skipped = 0, nf = 0, espera = 0, semBusca = false;
   try {
     log('Lendo a playlist do Spotify…');
     const tracks = await spTracks(spId(c.spPlaylist));
@@ -356,7 +358,15 @@ async function sync(){
       if (!vid && pend[t.id] && !retry){ nf++; continue; }
       if (vid && inPl.has(vid)){ skipped++; continue; }
       if (!vid){
-        const r = await findVideo(t, tolMs, wide);
+        if (semBusca){ espera++; continue; }
+        let r;
+        try { r = await findVideo(t, tolMs, wide); }
+        catch (e){
+          if (!isQuota(e)) throw e;
+          semBusca = true; espera++;
+          log('A cota de busca do YouTube acabou por hoje. Sigo sem buscar vídeos novos; as que faltam ficam para outro dia.', 'warn');
+          continue;
+        }
         if (!r.id){
           const reason = motivo(r.fail);
           pend[t.id] = { label, reason, q: `${t.artists[0]} ${coreName(t.name)}` };
@@ -380,10 +390,13 @@ async function sync(){
       const ids = new Set(tracks.map(t => t.id));
       for (const k of Object.keys(pend)) if (!ids.has(k)) delete pend[k];
       store.set('pend', pend);
-      if ($('rm').checked || $('rmAll').checked){
+      const total = $('rmAll').checked && !semBusca;
+      if ($('rmAll').checked && semBusca)
+        log('Espelho total pulado: ainda há músicas sem busca feita e eu poderia remover vídeos certos. Rode de novo quando a cota voltar.', 'warn');
+      if ($('rm').checked || total){
         const keep = new Set(tracks.map(t => cache[t.id]).filter(Boolean));
         const alvo = new Map();
-        if ($('rmAll').checked){
+        if (total){
           for (const [vid, info] of inPl) if (!keep.has(vid)) alvo.set(vid, info);
         } else {
           for (const k of Object.keys(cache)){
@@ -406,9 +419,9 @@ async function sync(){
         }
       }
     }
-    log(`Pronto. Adicionadas: ${added}. Removidas: ${removed}. Já estavam: ${skipped}. Sem vídeo confiável: ${nf}.`, 'ok');
+    log(`Pronto. Adicionadas: ${added}. Removidas: ${removed}. Já estavam: ${skipped}. Sem vídeo confiável: ${nf}.${espera ? ` Aguardando busca: ${espera}.` : ''}`, 'ok');
   } catch (e){
-    if (e.reason === 'quotaExceeded') log('Cota diária do YouTube acabou. O progresso foi guardado: rode de novo amanhã.', 'err');
+    if (isQuota(e)) log('Cota diária do YouTube acabou. O progresso foi guardado: rode de novo amanhã.', 'err');
     else if (e.status === 401) log('Login expirou. Conecte de novo.', 'err');
     else log('Erro: ' + e.message, 'err');
   }
