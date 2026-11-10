@@ -40,6 +40,12 @@ ol#log{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto;font-si
 #log .ok{color:var(--green)}
 #log .warn{color:var(--warn)}
 #log .err{color:var(--red)}
+ul#pend{list-style:none;margin:0;padding:0}
+#pend li{padding:12px 0;border-bottom:1px solid var(--line)}
+.pn{font-weight:600}
+.why{font-size:.875rem;color:var(--warn);margin:2px 0 8px}
+#pend a{display:inline-block;margin-bottom:8px;color:var(--ink);font-size:.9375rem}
+#pend .row input{flex:1;min-width:0}
 #prog{font-size:.875rem;color:var(--mute);margin:8px 0 0}
 </style>
 </head>
@@ -74,8 +80,18 @@ ol#log{list-style:none;margin:0;padding:0;max-height:340px;overflow:auto;font-si
 <label for="tol">Diferença máxima de duração (segundos)</label>
 <input type="number" id="tol" min="1" max="60" value="10">
 <label class="chk"><input type="checkbox" id="dry" checked> Só simular (não adiciona nada no YouTube)</label>
+<label class="chk"><input type="checkbox" id="wide" checked> Busca ampla: se não achar na categoria Música, procurar em todo o YouTube (gasta mais cota)</label>
+<label class="chk"><input type="checkbox" id="retry"> Tentar de novo as que já ficaram sem vídeo</label>
+<label class="chk"><input type="checkbox" id="rm" checked> Remover do YouTube as músicas que saíram da playlist do Spotify</label>
+<label class="chk"><input type="checkbox" id="rmAll"> Espelho total: remover também qualquer vídeo da playlist que a página não ligou a uma música do Spotify (teste antes com “Só simular”)</label>
 <div class="row"><button class="main" id="bGo" disabled>Sincronizar</button><button id="bClr">Limpar memória</button></div>
 <p id="prog"></p>
+</section>
+
+<section>
+<h2 id="pendTitle">Sem vídeo confiável</h2>
+<p class="status" id="pendEmpty">Nenhuma por enquanto.</p>
+<ul id="pend"></ul>
 </section>
 
 <section>
@@ -205,20 +221,20 @@ async function yt(path, params, opt = {}){
     headers: { Authorization: 'Bearer ' + ytToken, 'Content-Type': 'application/json' },
     body: opt.body ? JSON.stringify(opt.body) : undefined
   });
-  const j = await r.json();
+  const txt = await r.text(), j = txt ? JSON.parse(txt) : {};
   if (!r.ok) throw Object.assign(new Error(j.error?.message || 'YouTube respondeu ' + r.status),
     { reason: j.error?.errors?.[0]?.reason, status: r.status });
   return j;
 }
 
 async function ytExisting(pid){
-  const set = new Set(); let tok;
+  const map = new Map(); let tok;
   do {
-    const j = await yt('playlistItems', { part: 'contentDetails', playlistId: pid, maxResults: 50, ...(tok && { pageToken: tok }) });
-    j.items.forEach(i => set.add(i.contentDetails.videoId));
+    const j = await yt('playlistItems', { part: 'snippet,contentDetails', playlistId: pid, maxResults: 50, ...(tok && { pageToken: tok }) });
+    j.items.forEach(i => map.set(i.contentDetails.videoId, { itemId: i.id, title: i.snippet.title }));
     tok = j.nextPageToken;
   } while (tok);
-  return set;
+  return map;
 }
 
 /* ---------- casamento rigoroso: artista + nome + duração ---------- */
@@ -232,36 +248,100 @@ const dur = iso => {
   return ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0)) * 1000;
 };
 
-async function findVideo(t, tolMs){
+const ETAPAS = ['nenhum título tinha o nome da música', 'o nome apareceu, mas não o artista',
+  'só achei versões cover, remix ou ao vivo', 'a duração não bateu'];
+const motivo = f => f.etapa < 0 ? 'a busca não retornou vídeos' : ETAPAS[f.etapa] + (f.info ? ` (${f.info})` : '');
+
+async function buscar(t, tolMs, extra){
   const main = norm(coreName(t.name)), full = ' ' + norm(t.name) + ' ';
   const arts = t.artists.map(norm);
-  const s = await yt('search', { part: 'snippet', type: 'video', videoCategoryId: '10', maxResults: 10,
-    q: `${t.artists[0]} ${coreName(t.name)}` });
+  const s = await yt('search', { part: 'snippet', type: 'video', maxResults: 10,
+    q: `${t.artists[0]} ${coreName(t.name)}`, ...extra });
   const ids = s.items.map(i => i.id.videoId).join(',');
-  if (!ids) return null;
+  if (!ids) return { fail: { etapa: -1 } };
   const d = await yt('videos', { part: 'contentDetails,snippet', id: ids });
-  let best = null;
+  let best = null, fail = { etapa: -1 };
+  const rej = (etapa, info) => { if (etapa > fail.etapa) fail = { etapa, info }; };
   for (const v of d.items){
     const title = norm(v.snippet.title), chan = norm(v.snippet.channelTitle);
     const text = ` ${title} ${chan} `;
-    if (!text.includes(' ' + main + ' ')) continue;                       // nome da música
-    if (!arts.some(a => (title + ' ' + chan).includes(a))) continue;      // artista
-    if (BAD.some(w => text.includes(' ' + w + ' ') && !full.includes(' ' + w + ' '))) continue; // cover, remix, ao vivo...
+    if (!text.includes(' ' + main + ' ')){ rej(0); continue; }                     // nome da música
+    if (!arts.some(a => (title + ' ' + chan).includes(a))){ rej(1); continue; }    // artista
+    const bad = BAD.find(w => text.includes(' ' + w + ' ') && !full.includes(' ' + w + ' '));
+    if (bad){ rej(2, bad); continue; }                                             // cover, remix, ao vivo...
     const diff = Math.abs(dur(v.contentDetails.duration) - t.ms);
-    if (diff > tolMs) continue;                                           // duração
+    if (diff > tolMs){                                                             // duração
+      if (fail.etapa < 3 || diff < fail.diff)
+        fail = { etapa: 3, diff, info: `“${v.snippet.title}”, ${Math.round(diff / 1000)}s de diferença` };
+      continue;
+    }
     const score = 10 - diff / 1000 + (chan.endsWith(' topic') ? 5 : 0)
       + (title.includes('official audio') ? 2 : 0) + (title.includes('official') ? 1 : 0);
     if (!best || score > best.score) best = { id: v.id, score };
   }
-  return best ? best.id : null;
+  return best ? { id: best.id } : { fail };
+}
+
+async function findVideo(t, tolMs, wide){
+  const r = await buscar(t, tolMs, { videoCategoryId: '10' });
+  if (r.id || !wide) return r;
+  const r2 = await buscar(t, tolMs, {});
+  if (r2.id) return r2;
+  return { fail: r2.fail.etapa > r.fail.etapa ? r2.fail : r.fail };
+}
+
+/* ---------- lista das sem vídeo (escolha manual) ---------- */
+function renderPend(){
+  const pend = store.get('pend', {}), ul = $('pend'), ids = Object.keys(pend);
+  ul.textContent = '';
+  $('pendTitle').textContent = ids.length ? `Sem vídeo confiável (${ids.length})` : 'Sem vídeo confiável';
+  $('pendEmpty').hidden = ids.length > 0;
+  for (const id of ids){
+    const p = pend[id], li = document.createElement('li');
+    const nome = document.createElement('div'); nome.className = 'pn'; nome.textContent = p.label;
+    const why = document.createElement('div'); why.className = 'why'; why.textContent = p.reason;
+    const a = document.createElement('a');
+    a.href = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(p.q);
+    a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Buscar no YouTube';
+    const row = document.createElement('div'); row.className = 'row';
+    const inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = 'Cole o link do vídeo certo';
+    const btn = document.createElement('button'); btn.textContent = 'Usar este vídeo';
+    btn.onclick = () => useManual(id, inp.value);
+    row.append(inp, btn);
+    li.append(nome, why, a, row);
+    ul.append(li);
+  }
+}
+
+async function useManual(id, url){
+  const m = url.match(/(?:v=|youtu\.be\/|shorts\/|embed\/)([\w-]{11})/) || url.trim().match(/^([\w-]{11})$/);
+  if (!m) return log('Link não reconhecido. Cole o link completo do vídeo.', 'err');
+  const vid = m[1], c = cfg();
+  const cache = store.get('map', {}), pend = store.get('pend', {});
+  const label = pend[id] ? pend[id].label : id;
+  cache[id] = vid; store.set('map', cache);
+  delete pend[id]; store.set('pend', pend);
+  renderPend();
+  if (!ytToken || !c.ytPlaylist)
+    return log(`Vídeo guardado para ${label}. Conecte o Google e sincronize para adicionar.`, 'warn');
+  try {
+    const pid = ytId(c.ytPlaylist), inPl = await ytExisting(pid);
+    if (inPl.has(vid)) return log('Já estava na playlist: ' + label, 'ok');
+    await yt('playlistItems', { part: 'snippet' }, { method: 'POST',
+      body: { snippet: { playlistId: pid, resourceId: { kind: 'youtube#video', videoId: vid } } } });
+    log('Adicionada (manual): ' + label, 'ok');
+  } catch (e){
+    log('Erro: ' + e.message + '. O vídeo ficou guardado e entra na próxima sincronização.', 'err');
+  }
 }
 
 /* ---------- sincronização ---------- */
 async function sync(){
   const c = cfg(), dry = $('dry').checked, tolMs = (+c.tol || 10) * 1000;
+  const wide = $('wide').checked, retry = $('retry').checked;
   if (!c.spPlaylist || !c.ytPlaylist) return log('Preencha as duas playlists.', 'err');
   $('bGo').disabled = true;
-  const cache = store.get('map', {});
+  const cache = store.get('map', {}), pend = store.get('pend', {});
   let added = 0, skipped = 0, nf = 0;
   try {
     log('Lendo a playlist do Spotify…');
@@ -273,25 +353,66 @@ async function sync(){
       $('prog').textContent = `${i + 1} de ${tracks.length}`;
       const label = `${t.artists[0]} — ${t.name}`;
       let vid = cache[t.id];
-      if (vid === null){ nf++; continue; }
+      if (!vid && pend[t.id] && !retry){ nf++; continue; }
       if (vid && inPl.has(vid)){ skipped++; continue; }
       if (!vid){
-        vid = await findVideo(t, tolMs);
-        cache[t.id] = vid || null; store.set('map', cache);
-        if (!vid){ nf++; log('Sem vídeo confiável: ' + label, 'warn'); continue; }
+        const r = await findVideo(t, tolMs, wide);
+        if (!r.id){
+          const reason = motivo(r.fail);
+          pend[t.id] = { label, reason, q: `${t.artists[0]} ${coreName(t.name)}` };
+          store.set('pend', pend); nf++;
+          log(`Sem vídeo: ${label}. Motivo: ${reason}`, 'warn');
+          continue;
+        }
+        vid = r.id; cache[t.id] = vid; store.set('map', cache);
+        delete pend[t.id]; store.set('pend', pend);
       }
       if (inPl.has(vid)){ skipped++; continue; }
       if (dry){ log('Adicionaria: ' + label, 'ok'); continue; }
-      await yt('playlistItems', { part: 'snippet' }, { method: 'POST',
+      const ins = await yt('playlistItems', { part: 'snippet' }, { method: 'POST',
         body: { snippet: { playlistId: pid, resourceId: { kind: 'youtube#video', videoId: vid } } } });
-      inPl.add(vid); added++; log('Adicionada: ' + label, 'ok');
+      inPl.set(vid, { itemId: ins.id, title: label }); added++; log('Adicionada: ' + label, 'ok');
     }
-    log(`Pronto. Adicionadas: ${added}. Já estavam: ${skipped}. Sem vídeo confiável: ${nf}.`, 'ok');
+    let removed = 0;
+    if (!tracks.length){
+      log('A playlist do Spotify veio vazia. Por segurança, não removi nada do YouTube.', 'warn');
+    } else {
+      const ids = new Set(tracks.map(t => t.id));
+      for (const k of Object.keys(pend)) if (!ids.has(k)) delete pend[k];
+      store.set('pend', pend);
+      if ($('rm').checked || $('rmAll').checked){
+        const keep = new Set(tracks.map(t => cache[t.id]).filter(Boolean));
+        const alvo = new Map();
+        if ($('rmAll').checked){
+          for (const [vid, info] of inPl) if (!keep.has(vid)) alvo.set(vid, info);
+        } else {
+          for (const k of Object.keys(cache)){
+            const vid = cache[k];
+            if (!ids.has(k) && vid && inPl.has(vid) && !keep.has(vid)) alvo.set(vid, inPl.get(vid));
+          }
+        }
+        if (alvo.size && !dry && !confirm(`Vai remover ${alvo.size} vídeo(s) da playlist do YouTube que não estão na playlist do Spotify. Continuar?`)){
+          log('Remoção cancelada.', 'warn');
+        } else {
+          for (const [vid, info] of alvo){
+            if (dry){ log('Removeria: ' + info.title, 'warn'); continue; }
+            await yt('playlistItems', { id: info.itemId }, { method: 'DELETE' });
+            inPl.delete(vid); removed++; log('Removida: ' + info.title, 'warn');
+          }
+          if (!dry){
+            for (const k of Object.keys(cache)) if (!ids.has(k) && (!cache[k] || !inPl.has(cache[k]))) delete cache[k];
+            store.set('map', cache);
+          }
+        }
+      }
+    }
+    log(`Pronto. Adicionadas: ${added}. Removidas: ${removed}. Já estavam: ${skipped}. Sem vídeo confiável: ${nf}.`, 'ok');
   } catch (e){
     if (e.reason === 'quotaExceeded') log('Cota diária do YouTube acabou. O progresso foi guardado: rode de novo amanhã.', 'err');
     else if (e.status === 401) log('Login expirou. Conecte de novo.', 'err');
     else log('Erro: ' + e.message, 'err');
   }
+  renderPend();
   $('prog').textContent = '';
   $('bGo').disabled = !(spToken && ytToken);
 }
@@ -299,10 +420,16 @@ async function sync(){
 $('bSp').onclick = spLogin;
 $('bG').onclick = gLogin;
 $('bGo').onclick = sync;
-$('bClr').onclick = () => { store.set('map', {}); log('Memória de músicas limpa.'); };
+$('bClr').onclick = () => { store.set('map', {}); store.set('pend', {}); renderPend(); log('Memória de músicas limpa.'); };
+
+// versões antigas guardavam as sem vídeo como null: apaga para tentar de novo com os motivos
+(() => { const m = store.get('map', {}); let mudou = false;
+  for (const k in m) if (m[k] === null){ delete m[k]; mudou = true; }
+  if (mudou) store.set('map', m); })();
 
 spCallback().then(refresh);
 refresh();
+renderPend();
 </script>
 </body>
 </html>
